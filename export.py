@@ -102,6 +102,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--out", default="site", help="directory to write JSON into")
     ap.add_argument("--refresh", action="store_true", help="force a synchronous MV refresh first")
+    ap.add_argument("--min-events", type=int, default=0,
+                    help="fail instead of publishing a run that ingested fewer than this")
     args = ap.parse_args()
 
     if args.refresh:
@@ -130,6 +132,14 @@ def main():
         f"{summary['missing_events']} missing "
         f"({summary['loss_rate'] * 100:.3f}%), history={len(history)} runs"
     )
+
+    # Publishing an empty run would replace a working dashboard with a broken-looking
+    # one. Failing here leaves the previous publish in place, which is the safer state.
+    if summary["events"] < args.min_events:
+        raise SystemExit(
+            f"only {summary['events']} events, below the --min-events floor of "
+            f"{args.min_events}; refusing to publish"
+        )
 
 
 if __name__ == "__main__":

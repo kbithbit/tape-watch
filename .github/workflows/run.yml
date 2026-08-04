@@ -1,0 +1,84 @@
+name: run
+
+# The entire runtime of this project. Every 30 minutes GitHub hands us a machine,
+# we boot a warehouse on it, ingest live market data, publish the result, and the
+# machine is destroyed. No server, no cluster, no bill.
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Runs must not overlap: two of them would race on history.json and one update
+# would be lost. Queue instead of cancelling -- a cancelled run publishes nothing.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  STARROCKS_IMAGE: starrocks/allin1-ubuntu:3.5.20
+  STARROCKS_FE: http://127.0.0.1:8030
+  PAGES_URL: https://kbithbit.github.io/tape-watch
+  INGEST_SECONDS: "180"
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+
+      - name: Start StarRocks
+        run: docker run -d --name starrocks --network host $STARROCKS_IMAGE
+
+      - name: Wait for FE and a live backend
+        run: python -m sr wait
+
+      - name: Apply schema and health view
+        run: |
+          python -m sr apply sql/schema.sql
+          python -m sr apply sql/mv.sql
+
+      - name: Ingest live from Binance
+        run: python ingester.py --starrocks $STARROCKS_FE --seconds $INGEST_SECONDS
+
+      # The warehouse is destroyed with the runner, so run-over-run history has to
+      # live outside it. The published site is that store: read back what we
+      # published last time, and export appends this run to it.
+      - name: Carry forward history from the live site
+        run: |
+          mkdir -p site
+          curl -fsS "$PAGES_URL/history.json" -o site/history.json \
+            || echo "no published history yet - starting a new series"
+
+      # --min-events refuses to publish a run that ingested almost nothing, so a
+      # dead socket leaves the previous dashboard up instead of replacing it with
+      # a convincing-looking empty one.
+      - name: Export metrics
+        run: python export.py --out site --refresh --min-events 100
+
+      - name: Assemble site
+        run: cp dashboard.html site/index.html
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - id: deploy
+        uses: actions/deploy-pages@v4
+
+      - name: StarRocks logs
+        if: failure()
+        run: docker logs starrocks 2>&1 | tail -100
