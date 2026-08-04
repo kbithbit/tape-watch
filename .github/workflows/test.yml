@@ -58,6 +58,27 @@ jobs:
         env:
           STARROCKS_E2E: "1"
 
+      - name: Create the health materialized view
+        run: python -m sr apply sql/mv.sql
+
+      # --refresh forces a synchronous refresh rather than waiting out the async
+      # schedule, which would cost a minute of CI for nothing.
+      - name: Export metrics
+        run: python export.py --out site --refresh
+
+      - name: Assert the view and the exported JSON
+        run: pytest tests/test_mv_e2e.py -q
+        env:
+          STARROCKS_E2E: "1"
+
+      - name: Upload metrics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: metrics
+          path: site/
+          if-no-files-found: warn
+
       - name: StarRocks logs
         if: failure()
         run: docker logs starrocks 2>&1 | tail -100
