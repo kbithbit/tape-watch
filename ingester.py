@@ -34,6 +34,7 @@ import argparse
 import asyncio
 import hashlib
 import json
+import os
 import random
 import time
 from datetime import datetime, timezone
@@ -42,7 +43,10 @@ from pathlib import Path
 import requests
 import websockets
 
-BINANCE_WS = "wss://stream.binance.com:9443/stream?streams={streams}"
+# data-stream.binance.vision, not stream.binance.com: the latter answers HTTP 451
+# (geo-blocked) from GitHub's US-based runners, while working fine from a laptop
+# elsewhere. Same market, same message format, no such restriction.
+WS_HOST = os.getenv("TAPEWATCH_WS_HOST", "wss://data-stream.binance.vision")
 DEFAULT_SYMBOLS = ("btcusdt", "ethusdt", "solusdt")
 BATCH_ROWS = 500
 BATCH_SECONDS = 1.0
@@ -54,7 +58,7 @@ def now_ms():
 
 
 def stream_url(symbols):
-    return BINANCE_WS.format(streams="/".join(f"{s}@trade" for s in symbols))
+    return f'{WS_HOST}/stream?streams={"/".join(f"{s}@trade" for s in symbols)}'
 
 
 def parse_frame(raw, recv_ms):
