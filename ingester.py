@@ -32,11 +32,14 @@ metric to trust. Worth knowing which of your numbers are honest.
 
 import argparse
 import asyncio
+import hashlib
 import json
 import random
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
+import requests
 import websockets
 
 BINANCE_WS = "wss://stream.binance.com:9443/stream?streams={streams}"
@@ -69,16 +72,22 @@ def parse_frame(raw, recv_ms):
     if not isinstance(data, dict) or data.get("e") != "trade":
         return None
     try:
+        event_ms = int(data["T"])
         return {
+            # event_ts is derived here, not in a Stream Load expression: the partition
+            # key is worth a duplicated field to keep the load definition trivial.
+            "event_ts": datetime.fromtimestamp(event_ms / 1000, timezone.utc).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            ),
             "symbol": data["s"],
             "trade_id": int(data["t"]),
             "price": str(data["p"]),
             "qty": str(data["q"]),
             "is_buyer_maker": bool(data["m"]),
-            "event_ms": int(data["T"]),
+            "event_ms": event_ms,
             "recv_ms": recv_ms,
         }
-    except (KeyError, TypeError, ValueError):
+    except (KeyError, TypeError, ValueError, OSError, OverflowError):
         return None
 
 
@@ -116,7 +125,7 @@ class Batcher:
         rows, self.rows, self.opened_at = self.rows, [], None
         send_ms = now_ms()
         for row in rows:
-            row["send_ms"] = send_ms
+            row.setdefault("send_ms", send_ms)  # replayed rows keep their original clock
         self.sink(rows)
         return len(rows)
 
@@ -140,10 +149,66 @@ class Stats:
     def __init__(self):
         self.trades = 0
         self.malformed = 0
+        self.dropped = 0
         self.events = []
 
     def event(self, kind, detail=""):
-        self.events.append({"ts_ms": now_ms(), "kind": kind, "detail": str(detail)[:500]})
+        self.events.append(
+            {
+                "ts": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                "kind": kind,
+                "detail": str(detail)[:500],
+            }
+        )
+
+
+class StreamLoadSink:
+    """POST a batch to StarRocks Stream Load.
+
+    The label is a hash of the payload, so retrying an identical batch reuses the label
+    and StarRocks rejects it as already-loaded. Content-addressed idempotency: no state
+    to track, and a retry after an ambiguous timeout cannot double-load.
+    """
+
+    OK = ("Success", "Label Already Exists")
+
+    def __init__(self, host, table="trades", db="tapewatch", auth=("root", ""), stats=None):
+        self.url = f"{host.rstrip('/')}/api/{db}/{table}/_stream_load"
+        self.auth = auth
+        self.stats = stats or Stats()
+        self.loaded = 0
+
+    def __call__(self, rows):
+        payload = json.dumps(rows).encode()
+        headers = {
+            "Expect": "100-continue",
+            "format": "json",
+            "strip_outer_array": "true",
+            "label": "tw-" + hashlib.sha1(payload).hexdigest(),
+        }
+        try:
+            resp = requests.put(
+                self.url, data=payload, headers=headers, auth=self.auth,
+                allow_redirects=False, timeout=60,
+            )
+            # The FE answers 307 with the BE that should take the write. requests drops
+            # the Authorization header across hosts on redirect, so re-send it by hand.
+            if resp.status_code in (307, 308):
+                resp = requests.put(
+                    resp.headers["Location"], data=payload, headers=headers,
+                    auth=self.auth, allow_redirects=False, timeout=60,
+                )
+            body = resp.json()
+        except Exception as exc:  # noqa: BLE001 - a failed load is data to record
+            self.stats.event("load_error", f"{type(exc).__name__}: {exc}")
+            self.stats.dropped += len(rows)
+            return
+
+        if body.get("Status") not in self.OK:
+            self.stats.event("load_error", body.get("Message", body.get("Status", "?")))
+            self.stats.dropped += len(rows)
+            return
+        self.loaded += body.get("NumberLoadedRows", len(rows))
 
 
 async def run(url, sink, seconds=None, stats=None, batch_seconds=BATCH_SECONDS):
@@ -188,24 +253,59 @@ async def run(url, sink, seconds=None, stats=None, batch_seconds=BATCH_SECONDS):
     return stats
 
 
+def replay(path, sink, stats=None):
+    """Push a recorded JSONL capture through the same batching and sink path.
+
+    Lets CI exercise the real load path against a fixture whose expected answer is
+    known -- something a live market can never give you.
+    """
+    stats = stats or Stats()
+    batcher = Batcher(sink, max_seconds=float("inf"))
+    with open(path) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            batcher.add(json.loads(line), now=0.0)
+            stats.trades += 1
+    batcher.flush()
+    return stats
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--out", help="directory for JSONL output")
+    ap.add_argument("--out", help="write JSONL to this directory")
+    ap.add_argument("--starrocks", help="FE http address, e.g. http://localhost:8030")
+    ap.add_argument("--replay", help="load this JSONL file instead of the live socket")
     ap.add_argument("--seconds", type=float, help="stop after N seconds (default: forever)")
     ap.add_argument("--symbols", default=",".join(DEFAULT_SYMBOLS))
     args = ap.parse_args()
 
-    if not args.out:
-        ap.error("--out is required (--starrocks arrives in phase 2)")
+    if bool(args.out) == bool(args.starrocks):
+        ap.error("give exactly one of --out or --starrocks")
 
-    symbols = [s.strip().lower() for s in args.symbols.split(",") if s.strip()]
-    path = Path(args.out) / f"live-{time.strftime('%Y%m%dT%H%M%S')}.jsonl"
-    stats = asyncio.run(run(stream_url(symbols), JsonlSink(path), seconds=args.seconds))
+    stats = Stats()
+    if args.starrocks:
+        sink = StreamLoadSink(args.starrocks, stats=stats)
+    else:
+        sink = JsonlSink(Path(args.out) / f"live-{time.strftime('%Y%m%dT%H%M%S')}.jsonl")
 
-    print(f"{path}: {stats.trades} trades, {stats.malformed} malformed")
+    if args.replay:
+        replay(args.replay, sink, stats)
+    else:
+        symbols = [s.strip().lower() for s in args.symbols.split(",") if s.strip()]
+        asyncio.run(run(stream_url(symbols), sink, seconds=args.seconds, stats=stats))
+
+    if args.starrocks and stats.events:
+        StreamLoadSink(args.starrocks, table="ingest_events", stats=Stats())(stats.events)
+
+    loaded = getattr(sink, "loaded", stats.trades)
+    print(f"{stats.trades} trades, {loaded} loaded, {stats.dropped} dropped, "
+          f"{stats.malformed} malformed")
     for event in stats.events:
         print(f"  {event['kind']}: {event['detail']}")
+    return 1 if stats.dropped else 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

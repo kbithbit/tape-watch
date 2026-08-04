@@ -2,7 +2,30 @@
 
 import json
 
-from ingester import Batcher, JsonlSink, parse_frame, stream_url
+import ingester
+from ingester import Batcher, JsonlSink, Stats, StreamLoadSink, parse_frame, stream_url
+
+
+class FakeResponse:
+    def __init__(self, status_code=200, body=None, location=None):
+        self.status_code = status_code
+        self._body = body or {"Status": "Success", "NumberLoadedRows": 2}
+        self.headers = {"Location": location} if location else {}
+
+    def json(self):
+        return self._body
+
+
+def fake_put(monkeypatch, *responses):
+    """Queue responses for successive requests.put calls; record what was sent."""
+    calls = []
+
+    def _put(url, **kwargs):
+        calls.append({"url": url, **kwargs})
+        return responses[min(len(calls) - 1, len(responses) - 1)]
+
+    monkeypatch.setattr(ingester.requests, "put", _put)
+    return calls
 
 FRAME = json.dumps(
     {
@@ -89,3 +112,75 @@ def test_stream_url_builds_combined_stream():
     assert stream_url(["btcusdt", "ethusdt"]).endswith(
         "streams=btcusdt@trade/ethusdt@trade"
     )
+
+
+ROWS = [{"trade_id": 1, "symbol": "BTCUSDT"}, {"trade_id": 2, "symbol": "BTCUSDT"}]
+
+
+def test_label_is_content_addressed(monkeypatch):
+    """Same rows must produce the same label, or retries double-load."""
+    calls = fake_put(monkeypatch, FakeResponse())
+    StreamLoadSink("http://fe:8030", stats=Stats())(ROWS)
+    StreamLoadSink("http://fe:8030", stats=Stats())(list(ROWS))
+    assert calls[0]["headers"]["label"] == calls[1]["headers"]["label"]
+
+    StreamLoadSink("http://fe:8030", stats=Stats())(ROWS + [{"trade_id": 3}])
+    assert calls[2]["headers"]["label"] != calls[0]["headers"]["label"]
+
+
+def test_redirect_is_followed_with_auth_reattached(monkeypatch):
+    """requests drops Authorization across hosts, so the retry must carry it explicitly."""
+    calls = fake_put(
+        monkeypatch,
+        FakeResponse(307, location="http://be:8040/api/tapewatch/trades/_stream_load"),
+        FakeResponse(),
+    )
+    sink = StreamLoadSink("http://fe:8030", stats=Stats())
+    sink(ROWS)
+
+    assert calls[0]["url"].startswith("http://fe:8030")
+    assert calls[1]["url"].startswith("http://be:8040")
+    assert calls[1]["auth"] == ("root", "")
+    assert calls[1]["headers"]["label"] == calls[0]["headers"]["label"]
+    assert sink.loaded == 2
+
+
+def test_duplicate_label_is_success_not_a_drop(monkeypatch):
+    fake_put(monkeypatch, FakeResponse(body={"Status": "Label Already Exists"}))
+    stats = Stats()
+    StreamLoadSink("http://fe:8030", stats=stats)(ROWS)
+    assert stats.dropped == 0
+    assert stats.events == []
+
+
+def test_failed_load_is_counted_not_raised(monkeypatch):
+    fake_put(monkeypatch, FakeResponse(body={"Status": "Fail", "Message": "boom"}))
+    stats = Stats()
+    StreamLoadSink("http://fe:8030", stats=stats)(ROWS)
+    assert stats.dropped == 2
+    assert stats.events[0]["kind"] == "load_error"
+    assert "boom" in stats.events[0]["detail"]
+
+
+def test_network_error_is_counted_not_raised(monkeypatch):
+    def explode(url, **kwargs):
+        raise ConnectionError("no route to host")
+
+    monkeypatch.setattr(ingester.requests, "put", explode)
+    stats = Stats()
+    StreamLoadSink("http://fe:8030", stats=stats)(ROWS)
+    assert stats.dropped == 2
+    assert "no route to host" in stats.events[0]["detail"]
+
+
+def test_replay_preserves_original_send_ms(tmp_path):
+    """Replayed rows keep the clocks they were captured with, or the fixture lies."""
+    path = tmp_path / "capture.jsonl"
+    path.write_text(
+        json.dumps({"trade_id": 1, "recv_ms": 100, "send_ms": 700}) + "\n\n"
+        + json.dumps({"trade_id": 2, "recv_ms": 200, "send_ms": 700}) + "\n"
+    )
+    flushed = []
+    stats = ingester.replay(path, flushed.append)
+    assert stats.trades == 2
+    assert [r["send_ms"] for r in flushed[0]] == [700, 700]

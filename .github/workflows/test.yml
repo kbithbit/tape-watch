@@ -1,0 +1,63 @@
+name: test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+env:
+  # Pinned rather than :latest -- a warehouse that silently changes major version
+  # under your tests is not a test. 3.5 is the current LTS line.
+  STARROCKS_IMAGE: starrocks/allin1-ubuntu:3.5.20
+  STARROCKS_FE: http://127.0.0.1:8030
+
+jobs:
+  unit:
+    name: unit (no warehouse)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: pytest tests/ -q
+
+  warehouse:
+    name: end-to-end (real StarRocks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+
+      # Host networking, not a service container: Stream Load answers the FE request
+      # with a 307 redirect to the backend, and sharing the host's network namespace
+      # keeps that redirect target reachable without mapping or resolving anything.
+      - name: Start StarRocks
+        run: docker run -d --name starrocks --network host $STARROCKS_IMAGE
+
+      - name: Wait for FE and a live backend
+        run: python -m sr wait
+
+      - name: Apply schema
+        run: python -m sr apply sql/schema.sql
+
+      # fixtures/gaps.jsonl is a real capture with three ETHUSDT trades removed from
+      # the middle of the sequence. The expected answer is known, which live data
+      # can never give you.
+      - name: Load the doctored fixture
+        run: python ingester.py --starrocks $STARROCKS_FE --replay fixtures/gaps.jsonl
+
+      - name: Assert the pipeline found exactly the missing trades
+        run: pytest tests/test_starrocks_e2e.py -q
+        env:
+          STARROCKS_E2E: "1"
+
+      - name: StarRocks logs
+        if: failure()
+        run: docker logs starrocks 2>&1 | tail -100
