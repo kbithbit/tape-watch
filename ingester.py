@@ -172,10 +172,22 @@ class StreamLoadSink:
 
     OK = ("Success", "Label Already Exists")
 
+    # A column's DEFAULT is not applied to a JSON load that omits the key -- the row is
+    # rejected as NULL instead. Naming load_ts here as a derived column is what actually
+    # stamps it, and keeps it the *server's* clock rather than another of ours.
+    COLUMNS = {
+        "trades": (
+            "event_ts,symbol,trade_id,price,qty,is_buyer_maker,"
+            "event_ms,recv_ms,send_ms,load_ts=current_timestamp()"
+        ),
+        "ingest_events": None,  # payload already carries every column
+    }
+
     def __init__(self, host, table="trades", db="tapewatch", auth=("root", ""), stats=None):
         self.url = f"{host.rstrip('/')}/api/{db}/{table}/_stream_load"
         self.auth = auth
         self.stats = stats or Stats()
+        self.columns = self.COLUMNS.get(table)
         self.loaded = 0
 
     def __call__(self, rows):
@@ -186,6 +198,8 @@ class StreamLoadSink:
             "strip_outer_array": "true",
             "label": "tw-" + hashlib.sha1(payload).hexdigest(),
         }
+        if self.columns:
+            headers["columns"] = self.columns
         try:
             resp = requests.put(
                 self.url, data=payload, headers=headers, auth=self.auth,

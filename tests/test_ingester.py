@@ -145,6 +145,19 @@ def test_redirect_is_followed_with_auth_reattached(monkeypatch):
     assert sink.loaded == 2
 
 
+def test_trades_load_names_load_ts_as_a_derived_column(monkeypatch):
+    """Omit load_ts and StarRocks rejects the row as NULL -- its DEFAULT does not apply."""
+    calls = fake_put(monkeypatch, FakeResponse())
+    StreamLoadSink("http://fe:8030", table="trades", stats=Stats())(ROWS)
+    assert "load_ts=current_timestamp()" in calls[0]["headers"]["columns"]
+
+
+def test_ingest_events_load_sends_no_column_mapping(monkeypatch):
+    calls = fake_put(monkeypatch, FakeResponse())
+    StreamLoadSink("http://fe:8030", table="ingest_events", stats=Stats())(ROWS)
+    assert "columns" not in calls[0]["headers"]
+
+
 def test_duplicate_label_is_success_not_a_drop(monkeypatch):
     fake_put(monkeypatch, FakeResponse(body={"Status": "Label Already Exists"}))
     stats = Stats()
