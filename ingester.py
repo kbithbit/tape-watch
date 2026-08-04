@@ -205,10 +205,30 @@ class StreamLoadSink:
             return
 
         if body.get("Status") not in self.OK:
-            self.stats.event("load_error", body.get("Message", body.get("Status", "?")))
+            self.stats.event("load_error", self._explain(body))
             self.stats.dropped += len(rows)
             return
         self.loaded += body.get("NumberLoadedRows", len(rows))
+
+    @staticmethod
+    def _explain(body):
+        """Summarise a rejection, following ErrorURL for the per-row reason.
+
+        StarRocks answers a rejected load with a generic message ("too many filtered
+        rows") and a URL holding the actual per-row cause. A loader that logs only the
+        generic half leaves you guessing at which column failed to convert.
+        """
+        parts = [
+            f"{body.get('Status')}: {body.get('Message', '')}",
+            f"loaded={body.get('NumberLoadedRows')} filtered={body.get('NumberFilteredRows')}",
+        ]
+        url = body.get("ErrorURL")
+        if url:
+            try:
+                parts.append(requests.get(url, timeout=15).text.strip()[:400])
+            except Exception as exc:  # noqa: BLE001 - diagnostics must not mask the error
+                parts.append(f"(ErrorURL {url} unreadable: {exc})")
+        return " | ".join(parts)
 
 
 async def run(url, sink, seconds=None, stats=None, batch_seconds=BATCH_SECONDS):
