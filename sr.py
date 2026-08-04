@@ -20,6 +20,9 @@ def connect(db=None):
     return pymysql.connect(
         host=HOST, port=PORT, user=USER, password=PASSWORD, database=db,
         cursorclass=pymysql.cursors.DictCursor, autocommit=True,
+        # Pin the session clock. Writers and readers inheriting different timezone
+        # defaults is how a freshness metric ends up negative.
+        init_command="SET time_zone = '+00:00'",
     )
 
 

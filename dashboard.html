@@ -1,0 +1,455 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tape-watch — pipeline health</title>
+<style>
+  /* Palette roles. Categorical slots 1-2 validated with the dataviz validator:
+     light #2a78d6/#eb6834 -> worst CVD dE 24.7; dark #3987e5/#d95926 -> 26.8.
+     Target is >=8, so both clear it comfortably. */
+  :root {
+    color-scheme: light;
+    --surface-1: #fcfcfb;
+    --plane: #f9f9f7;
+    --ink-1: #0b0b0b;
+    --ink-2: #52514e;
+    --ink-muted: #898781;
+    --grid: #e1e0d9;
+    --axis: #c3c2b7;
+    --border: rgba(11, 11, 11, .10);
+    --series-1: #2a78d6;
+    --series-2: #eb6834;
+    --track: #cde2fb;
+    --good: #0ca30c;
+    --warning: #fab219;
+    --critical: #d03b3b;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) {
+      color-scheme: dark;
+      --surface-1: #1a1a19; --plane: #0d0d0d; --ink-1: #fff; --ink-2: #c3c2b7;
+      --grid: #2c2c2a; --axis: #383835; --border: rgba(255,255,255,.10);
+      --series-1: #3987e5; --series-2: #d95926; --track: #184f95;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --surface-1: #1a1a19; --plane: #0d0d0d; --ink-1: #fff; --ink-2: #c3c2b7;
+    --grid: #2c2c2a; --axis: #383835; --border: rgba(255,255,255,.10);
+    --series-1: #3987e5; --series-2: #d95926; --track: #184f95;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 24px 20px 64px;
+    background: var(--plane); color: var(--ink-1);
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  .wrap { max-width: 1080px; margin: 0 auto; }
+  h1 { font-size: 20px; margin: 0; letter-spacing: -.01em; }
+  h2 { font-size: 14px; margin: 0 0 2px; font-weight: 600; }
+  a { color: var(--series-1); }
+  .sub, figcaption { color: var(--ink-2); font-size: 13px; }
+  .muted { color: var(--ink-muted); }
+
+  header { display: flex; flex-wrap: wrap; gap: 12px; align-items: baseline;
+           justify-content: space-between; margin-bottom: 20px; }
+
+  /* Scope chip: every panel says whether it is this run or accumulated history,
+     so nothing implies continuous coverage the pipeline does not have. */
+  .scope { font-size: 11px; text-transform: uppercase; letter-spacing: .06em;
+           color: var(--ink-muted); border: 1px solid var(--border);
+           border-radius: 999px; padding: 1px 8px; white-space: nowrap; }
+
+  .card { background: var(--surface-1); border: 1px solid var(--border);
+          border-radius: 10px; padding: 16px; margin: 0; }
+  .card > header { display: flex; justify-content: space-between; align-items: baseline;
+                   gap: 10px; margin-bottom: 12px; }
+  .grid { display: grid; gap: 14px; margin-bottom: 14px; }
+  @media (min-width: 780px) { .grid.two { grid-template-columns: 1fr 1fr; } }
+
+  .hero-value { font-size: 52px; font-weight: 600; line-height: 1.05; letter-spacing: -.02em; }
+  .kpis { display: grid; gap: 14px; grid-template-columns: repeat(2, 1fr); margin-bottom: 14px; }
+  @media (min-width: 780px) { .kpis { grid-template-columns: repeat(4, 1fr); } }
+  .kpi .v { font-size: 26px; font-weight: 600; letter-spacing: -.01em; }
+  .kpi .l { font-size: 13px; color: var(--ink-2); }
+
+  /* Status never rides on colour alone -- each chip carries a glyph and a word. */
+  .chip { display: inline-flex; align-items: center; gap: 6px; font-size: 13px;
+          border: 1px solid var(--border); border-radius: 999px; padding: 3px 10px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+
+  svg { width: 100%; height: auto; display: block; overflow: visible; }
+  .tick { fill: var(--ink-muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+  .lbl { fill: var(--ink-2); font-size: 12px; }
+  .gridline { stroke: var(--grid); stroke-width: 1; }
+  .axis { stroke: var(--axis); stroke-width: 1; }
+
+  .legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 13px; color: var(--ink-2); }
+  .key { width: 14px; height: 2px; border-radius: 1px; display: inline-block;
+         vertical-align: middle; margin-right: 6px; }
+
+  .meter { height: 8px; border-radius: 4px; background: var(--track); overflow: hidden; }
+  .meter > i { display: block; height: 100%; border-radius: 4px; background: var(--series-1); }
+
+  table { border-collapse: collapse; width: 100%; font-size: 13px;
+          font-variant-numeric: tabular-nums; }
+  th, td { text-align: right; padding: 6px 8px; border-bottom: 1px solid var(--border); }
+  th:first-child, td:first-child { text-align: left; font-variant-numeric: normal; }
+  th { color: var(--ink-2); font-weight: 600; }
+  .scroll { overflow-x: auto; }
+
+  .tip { position: fixed; pointer-events: none; opacity: 0; transition: opacity .1s;
+         background: var(--surface-1); color: var(--ink-1); border: 1px solid var(--border);
+         border-radius: 8px; padding: 8px 10px; font-size: 12px; z-index: 10;
+         box-shadow: 0 4px 16px rgba(0,0,0,.14); font-variant-numeric: tabular-nums; }
+  .banner { border: 1px solid var(--warning); border-radius: 8px; padding: 10px 14px;
+            margin-bottom: 16px; font-size: 13px; }
+  details { margin-top: 14px; } summary { cursor: pointer; color: var(--ink-2); font-size: 13px; }
+  .empty { color: var(--ink-muted); font-size: 13px; padding: 28px 0; text-align: center; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div>
+      <h1>tape-watch</h1>
+      <div class="sub">Binance trade pipeline, monitoring itself</div>
+    </div>
+    <div class="sub" id="provenance"></div>
+  </header>
+
+  <div id="banner"></div>
+
+  <section class="grid two">
+    <figure class="card">
+      <header><h2>Events lost</h2><span class="scope">this run</span></header>
+      <div class="hero-value" id="hero">—</div>
+      <figcaption id="hero-note"></figcaption>
+    </figure>
+    <figure class="card">
+      <header><h2>Pipeline state</h2><span class="scope">this run</span></header>
+      <div id="state" style="display:flex;flex-direction:column;gap:8px;margin-top:4px"></div>
+    </figure>
+  </section>
+
+  <section class="kpis" id="kpis"></section>
+
+  <section class="grid two">
+    <figure class="card">
+      <header><h2>Trades by symbol</h2><span class="scope">this run</span></header>
+      <div id="bysymbol"></div>
+      <figcaption>Bar length is trades ingested. Gaps are trade&#8209;ID sequence holes.</figcaption>
+    </figure>
+    <figure class="card">
+      <header><h2>Buy pressure</h2><span class="scope">this run</span></header>
+      <div id="pressure"></div>
+      <figcaption>Buyer&#8209;initiated share of volume, per symbol. Not averaged across
+        symbols — a ratio of ratios would weight a quiet symbol like a busy one.</figcaption>
+    </figure>
+  </section>
+
+  <section class="grid two">
+    <figure class="card">
+      <header><h2>Latency p95 across runs</h2><span class="scope">history</span></header>
+      <div class="legend" style="margin-bottom:8px">
+        <span><i class="key" style="background:var(--series-1)"></i>Ingest (skew&#8209;corrected)</span>
+        <span><i class="key" style="background:var(--series-2)"></i>Batching delay</span>
+      </div>
+      <div id="lat"></div>
+      <figcaption>Ingest lag is corrected by a per&#8209;window minimum filter; the raw
+        cross&#8209;clock figure is negative.</figcaption>
+    </figure>
+    <figure class="card">
+      <header><h2>Loss rate across runs</h2><span class="scope">history</span></header>
+      <div id="loss"></div>
+      <figcaption>Share of expected trades that never arrived, per run.</figcaption>
+    </figure>
+  </section>
+
+  <section class="card">
+    <header><h2>Ingest events</h2><span class="scope">this run</span></header>
+    <div class="scroll" id="events"></div>
+  </section>
+
+  <details>
+    <summary>Table view — every value in the charts above</summary>
+    <div class="card scroll" style="margin-top:10px" id="tables"></div>
+  </details>
+
+  <p class="sub muted" style="margin-top:24px">
+    StarRocks runs only inside CI: each run boots a cluster, ingests live for a few
+    minutes, exports these numbers, and is destroyed. "This run" panels come from that
+    window; "history" panels accumulate one record per run.
+  </p>
+</div>
+
+<div class="tip" id="tip"></div>
+
+<script type="application/json" id="sample">
+{"synthetic": true,
+ "metrics": {"summary": {"generated_at": "2026-08-04 18:04:11", "run_id": "sample", "run_url": null,
+   "minutes_covered": 1, "symbols": ["BTCUSDT", "ETHUSDT"], "events": 1171, "missing_events": 3,
+   "loss_rate": 0.002555366269165247, "ingest_lag_p95_ms": 97.0, "buffer_lag_p95_ms": 1433.0,
+   "skew_est_ms": -46, "reconnects": 0, "load_errors": 0},
+  "freshness": {"staleness_s": 4, "last_load_ts": "2026-08-04 18:04:07"},
+  "minutes": [
+   {"minute": "2026-08-04 17:25:00", "symbol": "BTCUSDT", "events": 569, "skew_est_ms": -46,
+    "ingest_lag_p50_ms": 7.0, "ingest_lag_p95_ms": 97.0, "buffer_lag_p50_ms": 709.0,
+    "buffer_lag_p95_ms": 1433.0, "missing_events": 0, "buy_pressure": 0.9992},
+   {"minute": "2026-08-04 17:25:00", "symbol": "ETHUSDT", "events": 602, "skew_est_ms": -46,
+    "ingest_lag_p50_ms": 12.0, "ingest_lag_p95_ms": 97.0, "buffer_lag_p50_ms": 305.0,
+    "buffer_lag_p95_ms": 1360.2, "missing_events": 3, "buy_pressure": 0.9977}],
+  "ingest_events": [{"ts": "2026-08-04 18:04:05", "kind": "connect", "detail": ""}]},
+ "history": []}
+</script>
+
+<script>
+const $ = s => document.querySelector(s);
+const svgNS = "http://www.w3.org/2000/svg";
+const el = (n, a = {}, p) => { const e = document.createElementNS(svgNS, n);
+  for (const k in a) e.setAttribute(k, a[k]); if (p) p.appendChild(e); return e; };
+
+const num = n => n == null ? "—" : n >= 1e6 ? (n / 1e6).toFixed(1) + "M"
+  : n >= 1e4 ? (n / 1e3).toFixed(1) + "K" : Math.round(n).toLocaleString();
+const ms = n => n == null ? "—" : n >= 1000 ? (n / 1000).toFixed(2) + " s" : Math.round(n) + " ms";
+const pct = n => n == null ? "—" : (n * 100).toFixed(3) + "%";
+const utc = s => s ? new Date(s.replace(" ", "T") + "Z") : null;
+const ago = d => { if (!d) return "—"; const m = (Date.now() - d) / 6e4;
+  return m < 1 ? "just now" : m < 60 ? Math.round(m) + " min ago"
+    : m < 1440 ? Math.round(m / 60) + " h ago" : Math.round(m / 1440) + " d ago"; };
+
+const tip = $("#tip");
+const showTip = (html, ev) => { tip.innerHTML = html; tip.style.opacity = 1;
+  tip.style.left = Math.min(ev.clientX + 14, innerWidth - tip.offsetWidth - 8) + "px";
+  tip.style.top = Math.max(ev.clientY - tip.offsetHeight - 12, 8) + "px"; };
+const hideTip = () => tip.style.opacity = 0;
+
+/* ---- charts -------------------------------------------------------------- */
+
+// Horizontal bars. One measure across nominal categories, so one hue for every bar --
+// shading by value would double-encode length as colour.
+function barChart(host, rows, opts) {
+  const W = 520, rowH = 34, pad = { l: 84, r: 62, t: 6, b: 6 };
+  const H = pad.t + pad.b + rows.length * rowH;
+  const svg = el("svg", { viewBox: `0 0 ${W} ${H}`, role: "img",
+    "aria-label": opts.label }, host);
+  const max = Math.max(...rows.map(r => r.value), 1);
+  const plot = W - pad.l - pad.r;
+
+  rows.forEach((r, i) => {
+    const y = pad.t + i * rowH, h = 18, w = Math.max(plot * r.value / max, 2);
+    el("text", { x: 0, y: y + h / 2 + 4, class: "lbl" }, svg).textContent = r.label;
+    // 4px rounded data-end, square at the baseline
+    const p = el("path", { d: `M0,0 H${Math.max(w - 4, 0)} a4,4 0 0 1 4,4 v${h - 8}
+      a4,4 0 0 1 -4,4 H0 Z`.replace(/\s+/g, " "),
+      transform: `translate(${pad.l},${y})`, fill: "var(--series-1)" }, svg);
+    el("text", { x: pad.l + w + 8, y: y + h / 2 + 4, class: "lbl" }, svg)
+      .textContent = num(r.value);
+    const hit = el("rect", { x: 0, y: y - 4, width: W, height: rowH,
+      fill: "transparent", style: "cursor:crosshair" }, svg);
+    hit.addEventListener("mousemove", e => showTip(r.tip, e));
+    hit.addEventListener("mouseleave", hideTip);
+    p.setAttribute("pointer-events", "none");
+  });
+  return svg;
+}
+
+// Multi-series line with a crosshair. Two series max here, both direct-labelled at
+// the end and carried by a legend, so identity is never colour-alone.
+function lineChart(host, points, series, opts) {
+  if (points.length < 2) {
+    host.innerHTML = `<div class="empty">${points.length} run so far —
+      the trend appears once a second run completes.</div>`;
+    return;
+  }
+  const W = 520, H = 210, pad = { l: 52, r: 54, t: 10, b: 26 };
+  const svg = el("svg", { viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": opts.label }, host);
+  const vals = series.flatMap(s => points.map(p => p[s.key])).filter(v => v != null);
+  // Ticks land on round numbers -- 0/500/1000/1500 reads, 645/1289/1934 does not.
+  const raw = Math.max(...vals, 0) || 1;
+  const pow = 10 ** Math.floor(Math.log10(raw / 4));
+  const n = raw / 4 / pow;
+  const step = (n <= 1 ? 1 : n <= 2 ? 2 : n <= 5 ? 5 : 10) * pow;
+  let max = step * Math.ceil(raw / step);
+  if (raw / max > .92) max += step;          // keep the peak off the top gridline
+  const X = i => pad.l + i * (W - pad.l - pad.r) / (points.length - 1);
+  const Y = v => H - pad.b - (v / max) * (H - pad.t - pad.b);
+
+  for (let v = 0; v <= max + 1e-12; v += step) {   // hairline grid, solid, recessive
+    const y = Y(v);
+    el("line", { x1: pad.l, x2: W - pad.r, y1: y, y2: y, class: "gridline" }, svg);
+    el("text", { x: pad.l - 8, y: y + 4, class: "tick", "text-anchor": "end" }, svg)
+      .textContent = opts.fmtAxis(v, step, max);
+  }
+  el("line", { x1: pad.l, x2: W - pad.r, y1: Y(0), y2: Y(0), class: "axis" }, svg);
+
+  series.forEach(s => {
+    const pts = points.map((p, i) => [X(i), Y(p[s.key] ?? 0)]);
+    if (opts.area) el("path", { d: `M${pts.map(p => p.join(",")).join("L")}
+      L${X(points.length - 1)},${Y(0)} L${X(0)},${Y(0)} Z`.replace(/\s+/g, " "),
+      fill: s.color, "fill-opacity": .1 }, svg);
+    el("path", { d: "M" + pts.map(p => p.join(",")).join("L"), fill: "none",
+      stroke: s.color, "stroke-width": 2, "stroke-linejoin": "round",
+      "stroke-linecap": "round", "vector-effect": "non-scaling-stroke" }, svg);
+    const last = pts[pts.length - 1];
+    el("circle", { cx: last[0], cy: last[1], r: 4, fill: s.color,
+      stroke: "var(--surface-1)", "stroke-width": 2 }, svg);   // 2px surface ring
+    el("text", { x: last[0] + 9, y: last[1] + 4, class: "lbl" }, svg)
+      .textContent = opts.fmtLabel(points[points.length - 1][s.key]);
+  });
+
+  el("text", { x: pad.l, y: H - 6, class: "tick" }, svg).textContent = opts.firstLabel;
+  el("text", { x: W - pad.r, y: H - 6, class: "tick", "text-anchor": "end" }, svg)
+    .textContent = "latest";
+
+  const cross = el("line", { class: "axis", y1: pad.t, y2: H - pad.b, opacity: 0 }, svg);
+  const dots = series.map(s => el("circle", { r: 4, fill: s.color,
+    stroke: "var(--surface-1)", "stroke-width": 2, opacity: 0 }, svg));
+  const hit = el("rect", { x: 0, y: 0, width: W, height: H, fill: "transparent",
+    style: "cursor:crosshair" }, svg);
+  hit.addEventListener("mousemove", e => {
+    const box = svg.getBoundingClientRect();
+    const rel = (e.clientX - box.left) / box.width * W;
+    const i = Math.max(0, Math.min(points.length - 1,
+      Math.round((rel - pad.l) / ((W - pad.l - pad.r) / (points.length - 1)))));
+    cross.setAttribute("x1", X(i)); cross.setAttribute("x2", X(i));
+    cross.setAttribute("opacity", 1);
+    series.forEach((s, k) => { dots[k].setAttribute("cx", X(i));
+      dots[k].setAttribute("cy", Y(points[i][s.key] ?? 0)); dots[k].setAttribute("opacity", 1); });
+    showTip(`<b>${points[i].label}</b><br>` + series.map(s =>
+      `<span style="color:${s.color}">●</span> ${s.name}: ${opts.fmtLabel(points[i][s.key])}`
+    ).join("<br>"), e);
+  });
+  hit.addEventListener("mouseleave", () => { hideTip(); cross.setAttribute("opacity", 0);
+    dots.forEach(d => d.setAttribute("opacity", 0)); });
+}
+
+/* ---- render -------------------------------------------------------------- */
+
+function render(metrics, history, synthetic) {
+  const s = metrics.summary, f = metrics.freshness || {};
+
+  if (synthetic) $("#banner").innerHTML = `<div class="banner"><b>Sample data.</b>
+    This page could not load <code>metrics.json</code>, so it is rendering the
+    fixture embedded in the file. Numbers below are from a real CI run but are not live.</div>`;
+
+  const gen = utc(s.generated_at);
+  $("#provenance").innerHTML = `Last run ${ago(gen)}` +
+    (s.run_url ? ` · <a href="${s.run_url}">CI run ${s.run_id}</a>` : "");
+
+  $("#hero").textContent = pct(s.loss_rate);
+  $("#hero-note").textContent =
+    `${num(s.missing_events)} of ${num(s.events + s.missing_events)} expected trades never `
+    + `arrived, proven by gaps in the exchange's trade-ID sequence.`;
+
+  // Status reads from a glyph and a word as well as a colour.
+  const level = (v, warn, crit) => v >= crit ? ["critical", "●", "Critical"]
+    : v >= warn ? ["warning", "●", "Degraded"] : ["good", "●", "Healthy"];
+  const chips = [
+    ["Data freshness", ...level(f.staleness_s ?? 0, 120, 600),
+      `${Math.round(f.staleness_s ?? 0)}s from last write to export`],
+    ["Event loss", ...level(s.loss_rate, .001, .01), pct(s.loss_rate) + " of expected trades"],
+    ["Delivery", ...level(s.load_errors + s.reconnects, 1, 5),
+      `${s.reconnects} reconnect(s), ${s.load_errors} failed load(s)`],
+  ];
+  $("#state").innerHTML = chips.map(([name, tone, glyph, word, detail]) =>
+    `<div class="chip" style="justify-content:space-between">
+       <span><i class="dot" style="background:var(--${tone})"></i> ${name}</span>
+       <span class="muted">${word} · ${detail}</span></div>`).join("");
+
+  $("#kpis").innerHTML = [
+    ["Trades ingested", num(s.events), `over ${s.minutes_covered} minute(s)`],
+    ["Ingest lag p95", ms(s.ingest_lag_p95_ms), `skew-corrected by ${s.skew_est_ms} ms`],
+    ["Batching delay p95", ms(s.buffer_lag_p95_ms), "our own 1 s flush window"],
+    ["Runs recorded", num(history.length), "one summary per CI run"],
+  ].map(([l, v, n]) => `<figure class="card kpi"><div class="l">${l}</div>
+    <div class="v">${v}</div><div class="sub muted">${n}</div></figure>`).join("");
+
+  // per-symbol rollup (sum events, sum gaps; buy pressure stays per symbol)
+  const bySym = {};
+  for (const m of metrics.minutes) {
+    const b = bySym[m.symbol] ||= { events: 0, missing: 0, bp: [] };
+    b.events += m.events; b.missing += m.missing_events; b.bp.push(m.buy_pressure);
+  }
+  const syms = Object.keys(bySym).sort();
+
+  barChart($("#bysymbol"), syms.map(k => ({
+    label: k, value: bySym[k].events,
+    tip: `<b>${k}</b><br>${num(bySym[k].events)} trades<br>${bySym[k].missing} missing`
+  })), { label: "Trades ingested by symbol" });
+
+  $("#pressure").innerHTML = syms.map(k => {
+    const v = bySym[k].bp.reduce((a, b) => a + b, 0) / bySym[k].bp.length;
+    return `<div style="margin-bottom:12px">
+      <div style="display:flex;justify-content:space-between;font-size:13px">
+        <span>${k}</span><span class="muted">${(v * 100).toFixed(1)}% buyer-initiated</span></div>
+      <div class="meter" style="margin-top:5px"><i style="width:${(v * 100).toFixed(1)}%"></i></div>
+    </div>`;
+  }).join("");
+
+  const pts = history.map((h, i) => ({
+    label: utc(h.generated_at)?.toISOString().slice(0, 16).replace("T", " ") + " UTC",
+    ingest: h.ingest_lag_p95_ms, buffer: h.buffer_lag_p95_ms, loss: h.loss_rate,
+    first: i === 0,
+  }));
+  const firstLabel = pts.length ? pts[0].label.slice(5, 10) : "";
+
+  lineChart($("#lat"), pts, [
+    { key: "ingest", name: "Ingest (corrected)", color: "var(--series-1)" },
+    { key: "buffer", name: "Batching delay", color: "var(--series-2)" },
+  ], { label: "p95 latency across runs",
+       fmtAxis: (v, s, top) => top >= 2000 ? (v / 1000).toFixed(1) + " s" : Math.round(v) + " ms",
+       fmtLabel: ms, firstLabel });
+
+  lineChart($("#loss"), pts, [
+    { key: "loss", name: "Loss rate", color: "var(--series-1)" },
+  ], { label: "Event loss rate across runs", area: true,
+       // decimals follow the tick step, so a 0.005% step never renders as "0.00%"
+       fmtAxis: (v, step) => (v * 100).toFixed(Math.max(0, -Math.floor(Math.log10(step * 100)))) + "%",
+       fmtLabel: pct, firstLabel });
+
+  const ev = metrics.ingest_events || [];
+  $("#events").innerHTML = ev.length
+    ? `<table><thead><tr><th>Time (UTC)</th><th>Kind</th><th>Detail</th></tr></thead><tbody>`
+      + ev.map(e => `<tr><td>${e.ts}</td><td>${e.kind}</td>
+        <td style="text-align:left">${(e.detail || "—").slice(0, 120)}</td></tr>`).join("")
+      + `</tbody></table>`
+    : `<div class="empty">No disconnects or failed loads in this run.</div>`;
+
+  $("#tables").innerHTML = `<h2>Per minute, per symbol — this run</h2>
+    <table><thead><tr><th>Minute</th><th>Symbol</th><th>Events</th><th>Missing</th>
+    <th>Ingest p50</th><th>Ingest p95</th><th>Batch p50</th><th>Batch p95</th>
+    <th>Buy pressure</th></tr></thead><tbody>`
+    + metrics.minutes.map(m => `<tr><td>${m.minute}</td><td>${m.symbol}</td>
+      <td>${num(m.events)}</td><td>${m.missing_events}</td><td>${ms(m.ingest_lag_p50_ms)}</td>
+      <td>${ms(m.ingest_lag_p95_ms)}</td><td>${ms(m.buffer_lag_p50_ms)}</td>
+      <td>${ms(m.buffer_lag_p95_ms)}</td><td>${(m.buy_pressure * 100).toFixed(1)}%</td></tr>`).join("")
+    + `</tbody></table>`
+    + (history.length ? `<h2 style="margin-top:20px">Run history</h2>
+      <table><thead><tr><th>Generated (UTC)</th><th>Events</th><th>Missing</th><th>Loss</th>
+      <th>Ingest p95</th><th>Batch p95</th><th>Skew</th></tr></thead><tbody>`
+      + history.slice().reverse().map(h => `<tr><td>${h.generated_at}</td>
+        <td>${num(h.events)}</td><td>${h.missing_events}</td><td>${pct(h.loss_rate)}</td>
+        <td>${ms(h.ingest_lag_p95_ms)}</td><td>${ms(h.buffer_lag_p95_ms)}</td>
+        <td>${h.skew_est_ms} ms</td></tr>`).join("") + `</tbody></table>` : "");
+}
+
+(async () => {
+  try {
+    const [m, h] = await Promise.all([
+      fetch("metrics.json").then(r => r.ok ? r.json() : Promise.reject(r.status)),
+      fetch("history.json").then(r => r.ok ? r.json() : []).catch(() => []),
+    ]);
+    render(m, Array.isArray(h) ? h : [], false);
+  } catch (err) {
+    // Opened from disk, or published before the first run finished. Render the
+    // embedded fixture and say so, rather than showing an empty page.
+    const s = JSON.parse($("#sample").textContent);
+    render(s.metrics, s.history, true);
+  }
+})();
+</script>
+</body>
+</html>

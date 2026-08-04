@@ -77,6 +77,18 @@ def test_metrics_json_has_what_the_dashboard_reads(metrics):
     assert metrics["minutes"], "dashboard needs per-minute rows to draw anything"
 
 
+def test_freshness_is_not_negative(metrics):
+    """Data cannot land in the future.
+
+    It measured -28796s (-8h exactly) before the timezone fix: Stream Load stamps
+    load_ts in Asia/Shanghai by default, while the query session read now() as UTC.
+    An exact whole-hour offset in a time delta is almost always a timezone, not a clock.
+    """
+    staleness = metrics["freshness"]["staleness_s"]
+    assert staleness >= 0, f"load_ts is {abs(staleness)}s in the future -- timezone mismatch"
+    assert staleness < 3600, "export ran suspiciously long after the last write"
+
+
 def test_history_starts_with_this_run():
     history = json.loads((SITE / "history.json").read_text())
     assert len(history) == 1

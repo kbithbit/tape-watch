@@ -196,6 +196,10 @@ class StreamLoadSink:
             "Expect": "100-continue",
             "format": "json",
             "strip_outer_array": "true",
+            # Stream Load defaults this to Asia/Shanghai, so load_ts=current_timestamp()
+            # gets stamped 8 hours ahead of a UTC query session and freshness reads
+            # negative. Never inherit a timezone default -- state it.
+            "timezone": "UTC",
             "label": "tw-" + hashlib.sha1(payload).hexdigest(),
         }
         if self.columns:

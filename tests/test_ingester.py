@@ -152,6 +152,13 @@ def test_trades_load_names_load_ts_as_a_derived_column(monkeypatch):
     assert "load_ts=current_timestamp()" in calls[0]["headers"]["columns"]
 
 
+def test_load_pins_the_timezone(monkeypatch):
+    """Stream Load defaults to Asia/Shanghai; inheriting that made freshness negative."""
+    calls = fake_put(monkeypatch, FakeResponse())
+    StreamLoadSink("http://fe:8030", stats=Stats())(ROWS)
+    assert calls[0]["headers"]["timezone"] == "UTC"
+
+
 def test_ingest_events_load_sends_no_column_mapping(monkeypatch):
     calls = fake_put(monkeypatch, FakeResponse())
     StreamLoadSink("http://fe:8030", table="ingest_events", stats=Stats())(ROWS)
