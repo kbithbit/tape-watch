@@ -1,0 +1,8 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# recorded live captures are scratch; curated fixtures are committed by name
+fixtures/live-*.jsonl
+metrics.json

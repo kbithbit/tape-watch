@@ -1,0 +1,4 @@
+websockets>=12.0
+requests>=2.31
+pymysql>=1.1
+pytest>=8.0
