@@ -158,8 +158,9 @@
         <span><i class="key" style="background:var(--series-2)"></i>Batching delay</span>
       </div>
       <div id="lat"></div>
-      <figcaption>Ingest lag is corrected by a per&#8209;window minimum filter; the raw
-        cross&#8209;clock figure is negative.</figcaption>
+      <figcaption>Ingest lag is corrected by a per&#8209;window minimum filter, because the
+        raw figure spans two machines' clocks. The offset differs per runner — it measured
+        &#8722;46&nbsp;ms on a laptop and +53&nbsp;ms in CI.</figcaption>
     </figure>
     <figure class="card">
       <header><h2>Loss rate across runs</h2><span class="scope">history</span></header>
