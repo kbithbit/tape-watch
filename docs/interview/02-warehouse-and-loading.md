@@ -221,6 +221,41 @@ count doesn't move.
 
 ---
 
+## 8. What actually broke on first contact
+
+Worth rehearsing, because "tell me about a bug you hit" is a near-certain question and a
+specific answer beats a generic one. Three failures, none of which local testing could
+have caught:
+
+**1. `pytest` failed in CI, passed locally.** Locally I ran `python -m pytest`, which puts
+the working directory on `sys.path`; CI ran bare `pytest`, which doesn't. Fixed with
+`pythonpath = .` in `pytest.ini`. The lesson is that *how* you invoke a test runner is part
+of the test environment.
+
+**2. The fixture predated the schema.** `gaps.jsonl` was captured before `event_ts` was
+added to the row shape, so every row failed the non-nullable partition column. Fixtures are
+code, and they drift from the schema exactly like code does.
+
+**3. A column DEFAULT is not applied to a JSON load that omits the key.** This is the real
+StarRocks lesson. `load_ts DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP` looks like it should
+fill itself in. It doesn't — Stream Load rejected every row with *"NULL value in non-nullable
+column 'load_ts'"*. The default applies to `INSERT`, not to a load that never mentions the
+column. The fix is naming it explicitly as a derived column in the mapping:
+`columns: ..., load_ts=current_timestamp()`.
+
+All three surfaced within four CI runs, because the diagnostics were fixed before the bug
+was. The first failure said only *"too many filtered rows"* — useless. StarRocks returns an
+`ErrorURL` holding the per-row cause, so the loader now follows it and logs the real reason.
+The next run named the exact column.
+
+> **Q: What would you do differently?**
+>
+> Follow `ErrorURL` from the start. I spent one CI cycle on a generic message when the
+> specific one was one HTTP request away. Generally: when a system gives you a summary
+> error and a pointer to detail, wire up the pointer before you start guessing.
+
+---
+
 ## The one-liner
 
 > "The test loads a real capture with three trades surgically removed, and asserts the
